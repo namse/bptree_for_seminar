@@ -18,26 +18,67 @@ impl Page {
     fn as_internal_node_mut(&mut self) -> &mut InternalNode {
         unsafe { &mut *(self.bytes.as_mut_ptr() as *mut InternalNode) }
     }
+
+    fn as_leaf_node(&self) -> &LeafNode {
+        unsafe { &*(self.bytes.as_ptr() as *const LeafNode) }
+    }
+
+    fn as_header_mut(&mut self) -> &mut Header {
+        unsafe { &mut *(self.bytes.as_mut_ptr() as *mut Header) }
+    }
+
+    fn as_header(&self) -> &Header {
+        unsafe { &*(self.bytes.as_ptr() as *const Header) }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 struct PageOffset {
     value: u32,
 }
+impl PageOffset {
+    fn new(value: u32) -> Self {
+        Self { value }
+    }
+}
 
 impl PageOffset {
-    const ROOT: PageOffset = PageOffset { value: 0 };
+    const HEADER: PageOffset = PageOffset { value: 0 };
+    const NULL: PageOffset = PageOffset { value: u32::MAX };
+}
+
+#[repr(C, align(64))]
+struct Header {
+    root_offset: PageOffset,
+    _padding: [u8; 4096 - 4],
+}
+impl Header {
+    fn new(root_offset: PageOffset) -> Self {
+        Self {
+            root_offset,
+            _padding: [0; 4096 - 4],
+        }
+    }
+    fn into_page(self) -> Page {
+        Page {
+            bytes: unsafe { std::mem::transmute::<Self, [u8; 4096]>(self) },
+        }
+    }
 }
 
 struct IdSet {
     pages: Vec<Page>,
-    // 0번 페이지 = root
+    // 0번 페이지를 root로 써선 안됩니다! 왜냐하면 root가 split되면 새로운 root가 생기니까요.
+    // 그래서 움직일 일이 없는 header를 0번 페이지에 두고, header에 root의 offset을 저장하는 방식으로 하겠습니다.
 }
 impl IdSet {
     fn new() -> Self {
         Self {
-            pages: vec![LeafNode::new().into_page()],
+            pages: vec![
+                Header::new(PageOffset::new(1)).into_page(),
+                LeafNode::new().into_page(),
+            ],
         }
     }
 
@@ -65,7 +106,8 @@ impl IdSet {
                 // pop했는데 아무것도 없다면, 이미 root 노드까지 온거고, root가 split된거야.
 
                 let new_root = InternalNode::new(center_id, left_node_offset, right_node_offset);
-                self.allocate_new_page(new_root.into_page());
+                let new_root_offset = self.allocate_new_page(new_root.into_page());
+                self.header_mut().root_offset = new_root_offset;
                 return;
             };
 
@@ -87,10 +129,18 @@ impl IdSet {
         }
     }
 
+    fn contains(&self, id: u128) -> bool {
+        let (leaf_node_offset, _) = self.find_leaf_node_to_insert(id);
+
+        let leaf_node = self.page(leaf_node_offset).as_leaf_node();
+
+        leaf_node.ids.iter().any(|&id_| id == id_)
+    }
+
     fn find_leaf_node_to_insert(&self, id: u128) -> (PageOffset, Vec<PageOffset>) {
         let mut parent_offsets = vec![];
 
-        let mut page_offset = PageOffset::ROOT;
+        let mut page_offset = self.header().root_offset;
 
         loop {
             let page = self.page(page_offset);
@@ -119,6 +169,14 @@ impl IdSet {
         };
         self.pages.push(page);
         page_offset
+    }
+
+    fn header_mut(&mut self) -> &mut Header {
+        self.page_mut(PageOffset::HEADER).as_header_mut()
+    }
+
+    fn header(&self) -> &Header {
+        self.page(PageOffset::HEADER).as_header()
     }
 }
 
@@ -152,18 +210,19 @@ impl InternalNode {
                 ids_
             },
             child_offsets: {
-                let mut child_offsets = [PageOffset::ROOT; INTERNAL_NODE_MAX_LEN + 1];
+                let mut child_offsets = [PageOffset::NULL; INTERNAL_NODE_MAX_LEN + 1];
                 child_offsets[..pages.len()].copy_from_slice(pages);
                 child_offsets
             },
         }
     }
     fn find_offset_to_insert(&self, id: u128) -> PageOffset {
-        self.ids
+        let index = self
+            .ids
             .iter()
             .position(|&id_| id < id_)
-            .map(|index| self.child_offsets[index])
-            .unwrap_or(self.child_offsets[self.id_count as usize])
+            .unwrap_or(self.id_count as usize);
+        self.child_offsets[index]
     }
 
     fn into_page(self) -> Page {
@@ -216,7 +275,7 @@ impl InternalNode {
             ids
         };
         let one_more_offsets = {
-            let mut offsets = [PageOffset::ROOT; INTERNAL_NODE_MAX_LEN + 2];
+            let mut offsets = [PageOffset::NULL; INTERNAL_NODE_MAX_LEN + 2];
             offsets[..index + 1].copy_from_slice(&self.child_offsets[..index + 1]);
             offsets[index + 1] = right_node_offset;
             offsets[index + 2..].copy_from_slice(&self.child_offsets[index + 1..]);
@@ -293,10 +352,9 @@ impl LeafNode {
                 .copy_within(index..self.id_count as usize, index + 1);
         }
         self.ids[index] = id; // 넣으면
-
-        // 정렬된 상태가 유지되겠죠~?
-
         self.id_count += 1;
+
+        // 정렬된 상태가 유지!
     }
 
     /// NOTE: full일 때만 호출해주세요
@@ -329,10 +387,19 @@ fn main() {
         std::mem::size_of::<InternalNode>()
     );
     println!("Size of LeafNode: {}", std::mem::size_of::<LeafNode>());
+    println!("Size of Header: {}", std::mem::size_of::<Header>());
 
     let mut id_set = IdSet::new();
 
-    for i in 0..1000 {
+    const N: u128 = 10000;
+
+    for i in 0..N {
         id_set.insert(i);
     }
+
+    for i in 0..N * 2 {
+        assert_eq!(id_set.contains(i), i < N, "i: {}", i);
+    }
+
+    println!("All tests passed!");
 }
